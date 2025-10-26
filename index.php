@@ -13,7 +13,7 @@ header("Content-Type: application/json");
 // =====================
 // CONFIG
 // =====================
-$dotenv = parse_ini_file('/.env');
+// $dotenv = parse_ini_file(__DIR__.'/.env');
 
 $host   = getenv('DB_HOST');
 $port   = getenv('DB_PORT');
