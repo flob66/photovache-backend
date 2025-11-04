@@ -10,24 +10,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 header("Content-Type: application/json");
 
-// =====================
-// CONFIG
-// =====================
-// $dotenv = parse_ini_file(__DIR__.'/.env');
-
 $host   = getenv('DB_HOST');
 $port   = getenv('DB_PORT');
 $dbname = getenv('DB_NAME');
 $user   = getenv('DB_USER');
 $pass   = getenv('DB_PASS');
 
-$baseUrl = 'https://photovache-backend.onrender.com'; // <- ton URL publique
+$baseUrl = 'https://photovache-backend.onrender.com'; 
 $uploadDir = __DIR__.'/uploads/';
 if(!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
 
-// =====================
-// CONNEXION BDD
-// =====================
 try {
     $pdo = new PDO("mysql:host=$host;port=$port;dbname=$dbname;charset=utf8", $user, $pass);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -36,9 +28,6 @@ try {
     die(json_encode(["error" => $e->getMessage()]));
 }
 
-// =====================
-// HELPERS
-// =====================
 function saveBase64Image(?string $dataUrl, string $prefix): ?string {
     global $uploadDir, $baseUrl;
     if(!$dataUrl) return null;
@@ -54,15 +43,25 @@ function saveBase64Image(?string $dataUrl, string $prefix): ?string {
     return $baseUrl.'/uploads/'.$filename;
 }
 
-// =====================
-// ROUTE
-// =====================
+function handlePhotoUpdate($newData, $oldValue, $key) {
+    global $uploadDir;
+    if(array_key_exists($key, $newData)) {
+
+        if($newData[$key] === null && $oldValue) {
+            $filePath = $uploadDir . basename($oldValue);
+            if(file_exists($filePath)) unlink($filePath);
+        }
+
+        return $newData[$key] ? saveBase64Image($newData[$key], $key) : null;
+    }
+    return $oldValue;
+}
+
 $request = explode('/', trim($_SERVER['REQUEST_URI'],'/'));
 
 if($request[0] === 'vaches') {
     switch($_SERVER['REQUEST_METHOD']) {
 
-        // -----------------
         case 'GET':
             if(isset($request[1])) {
                 $id = intval($request[1]);
@@ -77,12 +76,10 @@ if($request[0] === 'vaches') {
 
             $vaches = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-            // Supprime les vaches sans numéro
             $vaches = array_filter($vaches, fn($v) => !empty($v['numero']));
             echo json_encode(array_values($vaches));
             break;
 
-        // -----------------
         case 'POST':
             $data = json_decode(file_get_contents("php://input"), true);
             if(empty($data['numero'])) {
@@ -98,16 +95,15 @@ if($request[0] === 'vaches') {
             $stmt->execute([
                 $data['numero'],
                 $data['nom'] ?? null,
-                saveBase64Image($data['photo_avant'], 'avant'),
-                saveBase64Image($data['photo_arriere'], 'arriere'),
-                saveBase64Image($data['photo_cote_gauche'], 'gauche'),
-                saveBase64Image($data['photo_cote_droit'], 'droite')
+                saveBase64Image($data['photo_avant'], 'photo_avant'),
+                saveBase64Image($data['photo_arriere'], 'photo_arriere'),
+                saveBase64Image($data['photo_cote_gauche'], 'photo_cote_gauche'),
+                saveBase64Image($data['photo_cote_droit'], 'photo_cote_droit')
             ]);
 
             echo json_encode(["success"=>true, "id"=>$pdo->lastInsertId()]);
             break;
 
-        // -----------------
         case 'PUT':
             if(!isset($request[1])) {
                 http_response_code(400);
@@ -118,7 +114,6 @@ if($request[0] === 'vaches') {
             $id = intval($request[1]);
             $data = json_decode(file_get_contents("php://input"), true);
 
-            // Récupère l'ancienne vache pour ne pas supprimer les photos existantes
             $stmtCheck = $pdo->prepare("SELECT * FROM vache WHERE id=?");
             $stmtCheck->execute([$id]);
             $old = $stmtCheck->fetch(PDO::FETCH_ASSOC);
@@ -130,17 +125,16 @@ if($request[0] === 'vaches') {
             $stmt->execute([
                 $data['numero'] ?? $old['numero'],
                 $data['nom'] ?? $old['nom'],
-                isset($data['photo_avant']) ? saveBase64Image($data['photo_avant'], 'avant') : $old['photo_avant'],
-                isset($data['photo_arriere']) ? saveBase64Image($data['photo_arriere'], 'arriere') : $old['photo_arriere'],
-                isset($data['photo_cote_gauche']) ? saveBase64Image($data['photo_cote_gauche'], 'gauche') : $old['photo_cote_gauche'],
-                isset($data['photo_cote_droit']) ? saveBase64Image($data['photo_cote_droit'], 'droite') : $old['photo_cote_droit'],
+                handlePhotoUpdate($data, $old['photo_avant'], 'photo_avant'),
+                handlePhotoUpdate($data, $old['photo_arriere'], 'photo_arriere'),
+                handlePhotoUpdate($data, $old['photo_cote_gauche'], 'photo_cote_gauche'),
+                handlePhotoUpdate($data, $old['photo_cote_droit'], 'photo_cote_droit'),
                 $id
             ]);
 
             echo json_encode(["success"=>true]);
             break;
 
-        // -----------------
         case 'DELETE':
             if(!isset($request[1])) {
                 http_response_code(400);
@@ -169,7 +163,6 @@ if($request[0] === 'vaches') {
             echo json_encode(["success"=>true]);
             break;
 
-        // -----------------
         default:
             http_response_code(405);
             echo json_encode(["error"=>"Méthode non autorisée"]);
