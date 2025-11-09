@@ -1,7 +1,7 @@
 <?php
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS, DELETE");
-header("Access-Control-Allow-Headers: Content-Type");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -19,32 +19,87 @@ $dbname = getenv('DB_NAME');
 $user   = getenv('DB_USER');
 $pass   = getenv('DB_PASS');
 
-$uploadDir = __DIR__.'/uploads/'; // dossier serveur si tu veux stocker certaines photos
-if(!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
+$uploadDir = __DIR__ . '/uploads/';
+if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
 
 try {
     $pdo = new PDO("mysql:host=$host;port=$port;dbname=$dbname;charset=utf8", $user, $pass);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-} catch(PDOException $e) {
+} catch (PDOException $e) {
     http_response_code(500);
     die(json_encode(["error" => $e->getMessage()]));
 }
 
 // =====================
+// TABLES INITIALES
+// =====================
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nom VARCHAR(100),
+    email VARCHAR(150) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    token VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+");
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS vache (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    numero VARCHAR(100) NOT NULL,
+    nom VARCHAR(100),
+    photo_avant TEXT,
+    photo_arriere TEXT,
+    photo_cote_gauche TEXT,
+    photo_cote_droit TEXT
+)
+");
+
+// =====================
 // HELPERS
 // =====================
 
-// Met à jour une photo : supprime l'ancienne si le champ est mis à null, sinon garde la nouvelle valeur
+function generateToken($email) {
+    return hash('sha256', $email . time() . bin2hex(random_bytes(16)));
+}
+
+function getBearerToken() {
+    $headers = getallheaders();
+    if (isset($headers['Authorization'])) {
+        if (preg_match('/Bearer\s(\S+)/', $headers['Authorization'], $matches)) {
+            return $matches[1];
+        }
+    }
+    return null;
+}
+
+function requireAuth($pdo) {
+    $token = getBearerToken();
+    if (!$token) {
+        http_response_code(401);
+        echo json_encode(["error" => "Token manquant"]);
+        exit;
+    }
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE token = ?");
+    $stmt->execute([$token]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$user) {
+        http_response_code(401);
+        echo json_encode(["error" => "Token invalide"]);
+        exit;
+    }
+    return $user;
+}
+
 function handlePhotoUpdate($newData, $oldValue, $key) {
     global $uploadDir;
-
-    if(array_key_exists($key, $newData)) {
-        // Si l'utilisateur supprime la photo, supprime le fichier serveur si présent
-        if($newData[$key] === null && $oldValue) {
+    if (array_key_exists($key, $newData)) {
+        if ($newData[$key] === null && $oldValue) {
             $filePath = $uploadDir . basename($oldValue);
-            if(file_exists($filePath)) unlink($filePath);
+            if (file_exists($filePath)) unlink($filePath);
         }
-        // Renvoie soit le nouveau chemin, soit null
         return $newData[$key] ?? null;
     }
     return $oldValue;
@@ -53,18 +108,86 @@ function handlePhotoUpdate($newData, $oldValue, $key) {
 // =====================
 // ROUTAGE
 // =====================
-$request = explode('/', trim($_SERVER['REQUEST_URI'],'/'));
+$request = explode('/', trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/'));
 
-if($request[0] === 'vaches') {
-    switch($_SERVER['REQUEST_METHOD']) {
+// =====================
+// AUTH ROUTES
+// =====================
+if ($request[0] === 'auth') {
+    switch ($request[1] ?? '') {
 
-        // -----------------
+        // -------- INSCRIPTION --------
+        case 'register':
+            $data = json_decode(file_get_contents("php://input"), true);
+            if (empty($data['email']) || empty($data['password'])) {
+                http_response_code(400);
+                echo json_encode(["error" => "Email et mot de passe requis"]);
+                exit;
+            }
+
+            $hash = password_hash($data['password'], PASSWORD_DEFAULT);
+            $token = generateToken($data['email']);
+
+            try {
+                $stmt = $pdo->prepare("INSERT INTO users (nom, email, password_hash, token) VALUES (?, ?, ?, ?)");
+                $stmt->execute([
+                    $data['nom'] ?? null,
+                    $data['email'],
+                    $hash,
+                    $token
+                ]);
+                echo json_encode(["success" => true, "token" => $token]);
+            } catch (PDOException $e) {
+                http_response_code(400);
+                echo json_encode(["error" => "Email déjà utilisé"]);
+            }
+            break;
+
+        // -------- CONNEXION --------
+        case 'login':
+            $data = json_decode(file_get_contents("php://input"), true);
+            $stmt = $pdo->prepare("SELECT * FROM users WHERE email=?");
+            $stmt->execute([$data['email']]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$user || !password_verify($data['password'], $user['password_hash'])) {
+                http_response_code(401);
+                echo json_encode(["error" => "Identifiants invalides"]);
+                exit;
+            }
+
+            $token = generateToken($user['email']);
+            $stmt = $pdo->prepare("UPDATE users SET token=? WHERE id=?");
+            $stmt->execute([$token, $user['id']]);
+
+            echo json_encode(["success" => true, "token" => $token, "user" => [
+                "id" => $user['id'],
+                "nom" => $user['nom'],
+                "email" => $user['email']
+            ]]);
+            break;
+
+        default:
+            http_response_code(404);
+            echo json_encode(["error" => "Route auth non trouvée"]);
+    }
+    exit;
+}
+
+// =====================
+// VACHES ROUTES (PROTÉGÉES)
+// =====================
+if ($request[0] === 'vaches') {
+    $user = requireAuth($pdo);
+
+    switch ($_SERVER['REQUEST_METHOD']) {
+
         case 'GET':
-            if(isset($request[1])) {
+            if (isset($request[1])) {
                 $id = intval($request[1]);
                 $stmt = $pdo->prepare("SELECT * FROM vache WHERE id=?");
                 $stmt->execute([$id]);
-            } else if(isset($_GET['numero'])) {
+            } else if (isset($_GET['numero'])) {
                 $stmt = $pdo->prepare("SELECT * FROM vache WHERE numero=?");
                 $stmt->execute([$_GET['numero']]);
             } else {
@@ -72,23 +195,19 @@ if($request[0] === 'vaches') {
             }
 
             $vaches = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            $vaches = array_filter($vaches, fn($v) => !empty($v['numero']));
-            echo json_encode(array_values($vaches));
+            echo json_encode($vaches);
             break;
 
-        // -----------------
         case 'POST':
             $data = json_decode(file_get_contents("php://input"), true);
-            if(empty($data['numero'])) {
+            if (empty($data['numero'])) {
                 http_response_code(400);
-                echo json_encode(["error"=>"Le numéro de vache est obligatoire"]);
+                echo json_encode(["error" => "Le numéro de vache est obligatoire"]);
                 exit;
             }
 
-            $stmt = $pdo->prepare("INSERT INTO vache 
-                (numero, nom, photo_avant, photo_arriere, photo_cote_gauche, photo_cote_droit)
-                VALUES (?, ?, ?, ?, ?, ?)");
-
+            $stmt = $pdo->prepare("INSERT INTO vache (numero, nom, photo_avant, photo_arriere, photo_cote_gauche, photo_cote_droit)
+                                   VALUES (?, ?, ?, ?, ?, ?)");
             $stmt->execute([
                 $data['numero'],
                 $data['nom'] ?? null,
@@ -98,14 +217,13 @@ if($request[0] === 'vaches') {
                 $data['photo_cote_droit'] ?? null
             ]);
 
-            echo json_encode(["success"=>true, "id"=>$pdo->lastInsertId()]);
+            echo json_encode(["success" => true, "id" => $pdo->lastInsertId()]);
             break;
 
-        // -----------------
         case 'PUT':
-            if(!isset($request[1])) {
+            if (!isset($request[1])) {
                 http_response_code(400);
-                echo json_encode(["error"=>"ID manquant"]);
+                echo json_encode(["error" => "ID manquant"]);
                 exit;
             }
 
@@ -130,27 +248,26 @@ if($request[0] === 'vaches') {
                 $id
             ]);
 
-            echo json_encode(["success"=>true]);
+            echo json_encode(["success" => true]);
             break;
 
-        // -----------------
         case 'DELETE':
-            if(!isset($request[1])) {
+            if (!isset($request[1])) {
                 http_response_code(400);
-                echo json_encode(["error"=>"ID manquant"]);
+                echo json_encode(["error" => "ID manquant"]);
                 exit;
             }
 
             $id = intval($request[1]);
-            $stmt = $pdo->prepare("SELECT photo_avant, photo_arriere, photo_cote_gauche, photo_cote_droit FROM vache WHERE id=?");
+            $stmt = $pdo->prepare("SELECT * FROM vache WHERE id=?");
             $stmt->execute([$id]);
             $vache = $stmt->fetch(PDO::FETCH_ASSOC);
 
-            if($vache) {
+            if ($vache) {
                 foreach (['photo_avant','photo_arriere','photo_cote_gauche','photo_cote_droit'] as $field) {
-                    if(!empty($vache[$field])) {
+                    if (!empty($vache[$field])) {
                         $filePath = $uploadDir . basename($vache[$field]);
-                        if(file_exists($filePath)) unlink($filePath);
+                        if (file_exists($filePath)) unlink($filePath);
                     }
                 }
             }
@@ -158,16 +275,16 @@ if($request[0] === 'vaches') {
             $stmt = $pdo->prepare("DELETE FROM vache WHERE id=?");
             $stmt->execute([$id]);
 
-            echo json_encode(["success"=>true]);
+            echo json_encode(["success" => true]);
             break;
 
-        // -----------------
         default:
             http_response_code(405);
-            echo json_encode(["error"=>"Méthode non autorisée"]);
+            echo json_encode(["error" => "Méthode non autorisée"]);
             break;
     }
 } else {
     http_response_code(404);
-    echo json_encode(["error"=>"Route non trouvée"]);
+    echo json_encode(["error" => "Route non trouvée"]);
 }
+?>
